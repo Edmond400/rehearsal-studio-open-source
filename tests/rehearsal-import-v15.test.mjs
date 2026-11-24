@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {dirname} from 'node:path';
+const require=createRequire(import.meta.url);
+const {build}=require(require.resolve('esbuild',{paths:[dirname(require.resolve('wrangler/package.json'))]}));
+const r=await build({entryPoints:['lib/rehearsal/import-guard.ts'],bundle:true,write:false,platform:'neutral',format:'esm'});
+const {normalizeImportedScript:n,importParagraphCount:p}=await import('data:text/javascript;base64,'+Buffer.from(r.outputFiles[0].text).toString('base64'));
+for(const s of ['', ' ', '\n \t\n', '\uFEFF\n  ', '\r\n\r\n'])assert.throws(()=>n(s),/讲稿为空/);
+assert.equal(n('甲\n乙'),'甲\n\n乙');assert.equal(n('甲\r\n乙'),'甲\n\n乙');
+assert.equal(p(n('甲\n乙\n\n丙')),3);assert.throws(()=>n('a'.repeat(80001)),/80000/);
+console.log('PASS V1.5 guarded script imports');

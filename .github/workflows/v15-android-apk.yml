@@ -1,0 +1,76 @@
+name: V1.5 native Android debug APK
+
+# Isolated APK acceptance lane. Does not deploy Workers, change D1 or sign a public release.
+on:
+  push:
+    branches: ['ci/v15-native-apk', 'work/r2-e35-site-cutover']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v15-android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  debug-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android 36 SDK packages from runner's existing SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          manager="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            manager="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          fi
+          test -x "$manager"
+          "$manager" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+      - name: Install locked web and native dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          npm ci --prefix mobile --no-audit --no-fund
+      - name: Build mobile Web assets for independent HTTPS API
+        env:
+          VITE_API_ORIGIN: https://studio.example.invalid
+        run: pnpm --dir mobile build
+      - name: Prepare Capacitor and Gradle wrapper
+        run: |
+          (cd mobile && node prepare-wrapper.mjs)
+          pnpm --dir mobile android:sync
+          test -s mobile/android/gradle/wrapper/gradle-wrapper.jar
+      - name: Compile test-only Android debug APK
+        working-directory: mobile/android
+        run: bash ./gradlew --no-daemon --stacktrace assembleDebug
+      - name: Validate Android package existence and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
+          unzip -t "$apk" >/dev/null
+          sha256sum "$apk"
+          echo 'DEBUG APK ONLY. Not production signed and not device accepted.'
+      - name: Retain private install-test debug APK for 7 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: v15-debug-apk-${{ github.sha }}
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+          if-no-files-found: error

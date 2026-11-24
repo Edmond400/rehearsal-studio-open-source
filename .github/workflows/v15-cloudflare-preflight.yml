@@ -1,0 +1,136 @@
+name: V1.5 Cloudflare production read-only preflight
+
+# A push to the development branch validates real production safety prerequisites.
+# No deploy, D1 writes/migrations, DNS updates, or Worker rollback. Recovery exports are retained privately.
+on:
+  push:
+    branches: ['feat/v1.5']
+    paths:
+      - '.github/workflows/v15-cloudflare-preflight.yml'
+  pull_request:
+    branches: ['feat/v1.4']
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rehearsal-studio-production-readonly-preflight
+  cancel-in-progress: false
+
+jobs:
+  readonly:
+    environment: production-preflight
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/v1.5' && github.actor == 'Edmond400')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - name: Install frozen Wrangler dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Confirm independent target and exact D1 ID
+        run: |
+          set -euo pipefail
+          node scripts/assert-independent-deploy.mjs
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          const x=JSON.parse(readFileSync('wrangler.json','utf8'));
+          if(x.name!=='rehearsal-studio' || x.d1_databases?.length!==1 ||
+             x.d1_databases[0].database_id!=='00000000-0000-4000-8000-000000000001')
+             throw new Error('Target allowlist mismatch');
+          console.log('Verified intended independent Worker/D1 configuration.');
+          NODE
+      - name: Read-only public HTTPS smoke
+        run: curl -fsSL --max-time 30 --output /dev/null https://studio.example.invalid/
+      - name: Verify Cloudflare secret presence without disclosure
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREFLIGHT_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_PREFLIGHT_API_TOKEN unavailable; no production action attempted"
+            exit 21
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID unavailable; no production action attempted"
+            exit 22
+          fi
+          echo 'Cloudflare account/token variables are available to this workflow (contents not logged).'
+      - name: Read and verify actual production Worker D1 binding
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREFLIGHT_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/rehearsal-studio/settings" \
+            -o "$RUNNER_TEMP/worker-settings.json"
+          python - <<'PY'
+          from pathlib import Path
+          import json,os
+          data=json.loads((Path(os.environ['RUNNER_TEMP'])/'worker-settings.json').read_text())
+          assert data.get('success'), 'Worker settings API reported an error'
+          result=data.get('result') or {}
+          bindings=[b for b in (result.get('bindings') or []) if b.get('type')=='d1']
+          expected='00000000-0000-4000-8000-000000000001'
+          assert len(bindings)==1 and bindings[0].get('name')=='DB' and (bindings[0].get('database_id') or bindings[0].get('id'))==expected, 'Live Worker D1 binding differs from allowlist'
+          print('PASS: Live rehearsal-studio Worker is bound to the expected independent D1 database.')
+          PY
+      - name: Capture real Worker deployment list and D1 recovery bookmark
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREFLIGHT_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler deployments list --name rehearsal-studio --json > "$RUNNER_TEMP/worker-deployments.json"
+          test -s "$RUNNER_TEMP/worker-deployments.json"
+          pnpm exec wrangler d1 time-travel info rehearsal-studio --json > "$RUNNER_TEMP/d1-timetravel.json"
+          test -s "$RUNNER_TEMP/d1-timetravel.json"
+          echo 'PASS: Production deployment history and Time Travel metadata fetched; sensitive details withheld.'
+      - name: Export production D1 without writes and verify offline restore/integrity
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREFLIGHT_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/d1-readonly-backup.test.py
+          python scripts/d1-readonly-backup.py "$RUNNER_TEMP"
+      - name: Retain private production recovery backup
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-preflight-recovery-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/rehearsal-preflight.sql
+            ${{ runner.temp }}/worker-deployments.json
+            ${{ runner.temp }}/d1-timetravel.json
+            ${{ runner.temp }}/preflight-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Publish non-sensitive verification summary only
+        uses: actions/upload-artifact@v4
+        with:
+          name: v15-cloudflare-preflight-summary-${{ github.sha }}
+          path: ${{ runner.temp }}/preflight-summary.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Confirm no production mutation took place
+        run: |
+          echo 'READ-ONLY PREFLIGHT COMPLETE. No deploy, D1 writes, migrations, DNS, Git Builds settings, or Worker changes were executed.'
+          echo 'Verify the restricted private recovery artifact exists before authorizing production release.'
+

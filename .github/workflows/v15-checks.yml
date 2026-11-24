@@ -1,0 +1,69 @@
+name: V1.5 checks
+on:
+  push:
+    branches: ['feat/v1.5', 'release/v1.5']
+  pull_request:
+    branches: ['feat/v1.4', 'feat/v1.5', 'main', 'release/v1.5', 'feat/operations-center-v01']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v15-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prepare Python test dependencies
+        run: python -m pip install --disable-pip-version-check python-pptx==1.0.2
+      - name: Type check
+        run: pnpm check
+      - name: V1.5 regressions
+        run: pnpm test:v15
+      - name: Core tests
+        run: pnpm test
+      - name: Security and access
+        run: pnpm test:security && node tests/studio-operations.test.mjs && node tests/studio-r2-read-compat.test.mjs
+      - name: Transport
+        run: pnpm test:transport
+      - name: Creation
+        run: pnpm test:creation
+      - name: Migrations and deploy guard
+        run: pnpm test:migration && pnpm test:deploy-guard
+      - name: V1.4 regressions
+        run: pnpm test:v14 && pnpm test:e2 && pnpm test:e3
+      - name: 20 MiB local D1 stress and resume regression
+        run: node tests/studio-large-files-v14.test.mjs
+      - name: R2 media write and isolated restore regression
+        run: python tests/test-r2-site-policy.py && python tests/test-r2-online-media-migration.py && node tests/studio-r2-write.test.mjs
+      - name: Web build
+        run: pnpm build
+      - name: Install Android shell dependencies
+        run: pnpm --dir mobile install --no-frozen-lockfile
+      - name: Install locked Android wrapper dependencies
+        run: npm ci --prefix mobile --no-audit --no-fund
+      - name: Android build
+        run: pnpm --dir mobile build
+      - name: Isolated Chromium E2E with synthetic D1
+        run: bash scripts/run-v15-browser-ci.sh
+      - name: Retain synthetic browser screenshots and local server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v15-browser-evidence-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/rehearsal-v15-evidence/
+            ${{ runner.temp }}/rehearsal-browser-server.log
+          if-no-files-found: ignore
+          retention-days: 7

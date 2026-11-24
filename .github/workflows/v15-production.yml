@@ -1,0 +1,361 @@
+name: V1.5 guarded production release
+
+# Manual deployment only: the job rejects all refs except release/v1.5 and requires an exact confirmation phrase.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Guarded E3/E3.5 operation or V1.5-R2-E4-COPY <batch-size>'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: rehearsal-studio-production
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.ref == 'refs/heads/release/v1.5' && inputs.confirmation == 'V1.5-R2-COMPAT-E3') }}
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - name: Check authorization, exact destination and credential presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          node scripts/assert-independent-deploy.mjs
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          const config=JSON.parse(readFileSync('wrangler.json','utf8'));
+          if(config.name!=='rehearsal-studio'||config.d1_databases?.length!==1||
+             config.d1_databases[0]?.database_id!=='00000000-0000-4000-8000-000000000001')
+             throw new Error('Production worker/D1 allowlist mismatch');
+          NODE
+      - run: pnpm install --frozen-lockfile
+      - name: Require successful CI for this exact release SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          count=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/v15-checks.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f branch=release/v1.5 -f event=push -f status=success \
+            | jq --arg sha "$GITHUB_SHA" '[.workflow_runs[] | select(.head_sha == $sha and .conclusion == "success")] | length')
+          test "$count" -gt 0
+          pnpm build
+      - name: Capture previous Worker deployment (private logs)
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler deployments list --name rehearsal-studio --json > "$RUNNER_TEMP/previous-deployment.json"
+          test -s "$RUNNER_TEMP/previous-deployment.json"
+      - name: Read-only live smoke test
+        run: curl --fail --silent --show-error --location --max-time 30 --output /dev/null https://studio.example.invalid/
+      - name: Capture D1 Time Travel bookmark before release
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler d1 time-travel info rehearsal-studio --json > "$RUNNER_TEMP/d1-bookmark.json"
+          test -s "$RUNNER_TEMP/d1-bookmark.json"
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          const raw=readFileSync(process.env.RUNNER_TEMP+'/d1-bookmark.json','utf8');
+          const obj=JSON.parse(raw);
+          if(!/[0-9a-f]{8}-[0-9a-f-]{16,}/i.test(JSON.stringify(obj)))throw new Error('D1 bookmark missing or malformed');
+          console.log('D1 time-travel recovery marker captured without logging its value.');
+          NODE
+      - name: Export D1 to protected ephemeral backup, verify local restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/d1-readonly-backup.test.py
+          python scripts/d1-readonly-backup.py "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/rehearsal-preflight.sql" "$RUNNER_TEMP/rehearsal-backup.sql"
+          cp "$RUNNER_TEMP/d1-timetravel.json" "$RUNNER_TEMP/d1-bookmark.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])
+          report=json.loads((p/'preflight-summary.json').read_text())
+          names=['rehearsal_projects','rehearsal_files','rehearsal_file_chunks','rehearsal_recordings','rehearsal_releases']
+          (p/'d1-preflight-counts.json').write_text(json.dumps({n:report['tableCounts'][n] for n in names}))
+          PY
+      # Artifact remains restricted to members with permissions on this private repository.
+      # Never echo SQL or tokens into Actions logs.
+      - name: Retain private recovery backup for 7 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-d1-backup-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/rehearsal-backup.sql
+            ${{ runner.temp }}/d1-bookmark.json
+            ${{ runner.temp }}/previous-deployment.json
+            ${{ runner.temp }}/d1-preflight-counts.json
+            ${{ runner.temp }}/preflight-summary.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Check target and build dry-run
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler deploy --dry-run --no-x-provision --outdir "$RUNNER_TEMP/rehearsal-dry-run"
+          node scripts/assert-independent-deploy.mjs
+      - name: Verify Access bindings and apply the additive E3 migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler secret list --name rehearsal-studio > "$RUNNER_TEMP/studio-secret-names.json"
+          pnpm exec wrangler d1 execute rehearsal-studio --remote --json --command "SELECT name FROM d1_migrations ORDER BY id" > "$RUNNER_TEMP/studio-migration-names.json"
+          node --input-type=module <<'NODE'
+          import {readdirSync,readFileSync} from 'node:fs';
+          const read = name => JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/'+name,'utf8'));
+          const names = read('studio-secret-names.json').map(secret => secret.name);
+          for (const key of ['STUDIO_ACCESS_ISSUER','STUDIO_ACCESS_AUDIENCE','STUDIO_PLATFORM_ADMIN_SUBJECTS'])
+            if (!names.includes(key)) throw new Error('Required Access binding missing: '+key);
+          const files = readdirSync('migrations').filter(name => name.endsWith('.sql')).sort();
+          const expected = [...files.filter(name => /^000[1-7]_/.test(name)), '0011_operations_observability.sql'];
+          const baseline = [...expected, '0012_r2_media_objects.sql'];
+          const target = [...baseline, '0013_r2_uploads.sql'];
+          const deployed = read('studio-migration-names.json')[0]?.results?.map(row => row.name);
+          if (expected.length !== 8 || JSON.stringify(files) !== JSON.stringify(target) ||
+              !Array.isArray(deployed) || ![baseline, target].some(list => JSON.stringify(list) === JSON.stringify(deployed)))
+            throw new Error('Unexpected database schema baseline; inspect before releasing.');
+          NODE
+          pnpm exec wrangler d1 migrations apply DB --remote --config wrangler.json
+      - name: Upload and verify the rehearsal-studio compatibility version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/assert-independent-deploy.mjs
+          # All binding targets are pre-existing and verified by the release guard.
+          NO_COLOR=1 pnpm exec wrangler versions upload --no-x-provision --name rehearsal-studio --message "Guarded release $GITHUB_SHA" | tee "$RUNNER_TEMP/studio-version-upload.log"
+          version=$(sed -nE 's/^Worker Version ID: ([a-f0-9-]+)$/\1/p' "$RUNNER_TEMP/studio-version-upload.log")
+          [[ "$version" =~ ^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$ ]]
+          printf '%s\n' "$version" > "$RUNNER_TEMP/studio-version-id"
+          pnpm exec wrangler versions view "$version" --name rehearsal-studio --json > "$RUNNER_TEMP/studio-candidate-metadata.json"
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          const dir = process.env.RUNNER_TEMP;
+          const expected = readFileSync(dir+'/studio-version-id','utf8').trim();
+          const version = JSON.parse(readFileSync(dir+'/studio-candidate-metadata.json','utf8'));
+          const bindings = version.resources?.bindings;
+          if (version.id !== expected || !Array.isArray(bindings)) throw new Error('Missing candidate Worker metadata');
+          for (const name of ['STUDIO_PASSWORD_PEPPER','STUDIO_ACCESS_ISSUER','STUDIO_ACCESS_AUDIENCE','STUDIO_PLATFORM_ADMIN_SUBJECTS'])
+            if (!bindings.some(binding => binding.name === name && binding.type === 'secret_text'))
+              throw new Error('Candidate is missing required secret binding: '+name);
+          const databases = bindings.filter(binding => binding.type === 'd1');
+          if (databases.length !== 1 || databases[0].name !== 'DB' || databases[0].id !== '00000000-0000-4000-8000-000000000001')
+            throw new Error('Candidate D1 binding does not match production');
+          const buckets = bindings.filter(binding => binding.type === 'r2_bucket');
+          if (buckets.length !== 1 || buckets[0].name !== 'STUDIO_MEDIA' || buckets[0].bucket_name !== 'rehearsal-studio-media')
+            throw new Error('Candidate R2 binding does not match production');
+          if (!bindings.some(binding => binding.name === 'STUDIO_R2_READS' && binding.type === 'plain_text' && binding.text === 'on') ||
+              bindings.some(binding => binding.name === 'STUDIO_R2_WRITES'))
+            throw new Error('Candidate must allow compatibility reads with writes disabled');
+          console.log('Verified exact Worker version and expected D1, R2 and Access bindings before traffic promotion.');
+          NODE
+      - name: Promote only the verified rehearsal-studio Worker version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat "$RUNNER_TEMP/studio-version-id")
+          pnpm exec wrangler versions deploy "${version}@100" --name rehearsal-studio --yes
+          pnpm exec wrangler triggers deploy --name rehearsal-studio
+      - name: HTTPS post-deploy availability check
+        run: curl --fail --silent --show-error --location --max-time 30 --output /dev/null https://studio.example.invalid/
+      - name: Verify unauthenticated Access rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in /admin /api/admin /api/admin/projects/unauthenticated-probe /platform-admin /api/platform-admin; do
+            status=$(curl --silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code}' "https://studio.example.invalid$path")
+            case "$status" in 302|303|401|403) ;; *) echo "Unexpected authorization status $status at $path"; exit 1 ;; esac
+          done
+      - name: Verify post-release D1 counts against the recovered preflight snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec wrangler d1 execute rehearsal-studio --remote --json --command "SELECT (SELECT count(*) FROM rehearsal_projects) AS rehearsal_projects, (SELECT count(*) FROM rehearsal_files) AS rehearsal_files, (SELECT count(*) FROM rehearsal_file_chunks) AS rehearsal_file_chunks, (SELECT count(*) FROM rehearsal_recordings) AS rehearsal_recordings, (SELECT count(*) FROM rehearsal_releases) AS rehearsal_releases" > "$RUNNER_TEMP/d1-postrelease-counts.json"
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          const dir=process.env.RUNNER_TEMP;
+          const before=JSON.parse(readFileSync(dir+'/d1-preflight-counts.json','utf8'));
+          const raw=JSON.parse(readFileSync(dir+'/d1-postrelease-counts.json','utf8'));
+          const rows=Array.isArray(raw)?raw:raw.result??[];
+          const after=Array.isArray(rows)?rows[0]?.results?.[0]??rows[0]:rows.results?.[0]??rows;
+          for(const [name,count] of Object.entries(before)){
+            if(!Number.isInteger(Number(after?.[name])))throw new Error('Missing remote D1 count: '+name);
+            if(Number(after[name])<count)throw new Error('D1 row count fell below preflight backup for '+name+'; investigate writes before rollback');
+          }
+          console.log('All monitored D1 table counts are at least their backup counts; no data values logged.');
+          NODE
+      - name: Record resulting Worker deployment (no secrets)
+        run: pnpm exec wrangler deployments list --name rehearsal-studio --json > "$RUNNER_TEMP/new-deployment.json"
+      - name: Explain recovery instructions on failure
+        if: failure()
+        run: |
+          echo 'Stop further writes. Inspect version and production data before rollback.'
+          echo 'Worker-only rollback: pnpm exec wrangler rollback <VERIFIED_PREVIOUS_VERSION_ID> --name rehearsal-studio --message "V1.5 rollback"'
+          echo 'Do not restore historical D1 SQL over new writes without reconciliation.'
+
+  e3-writes:
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.ref == 'refs/heads/release/v1.5' && (startsWith(inputs.confirmation, 'V1.5-R2-SYNTHETIC ') || startsWith(inputs.confirmation, 'V1.5-R2-RESUME ') || startsWith(inputs.confirmation, 'V1.5-R2-PILOT ') || startsWith(inputs.confirmation, 'V1.5-R2-OFF '))) }}
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      E3_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build the exact verified compatibility SHA for synthetic write activation
+        if: ${{ startsWith(inputs.confirmation, 'V1.5-R2-SYNTHETIC ') }}
+        run: pnpm build
+      - name: Execute the guarded E3 write operation
+        run: node scripts/rehearsal-e3-production.mjs
+
+  e35:
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.ref == 'refs/heads/release/v1.5' && startsWith(inputs.confirmation, 'V1.5-R2-E35 ')) }}
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.STUDIO_TEMP_RELEASE_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      E3_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require exact push CI before any production work
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/v15-checks.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f branch=release/v1.5 -f event=push -f status=success \
+            | jq -e --arg sha "$GITHUB_SHA" 'any(.workflow_runs[]; .head_sha == $sha and .conclusion == "success")'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build && node scripts/assert-independent-deploy.mjs
+      - name: Take one consistent read-only D1 backup and verify isolated restore
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$CLOUDFLARE_ACCOUNT_ID" = 00000000000000000000000000000000
+          dir="$RUNNER_TEMP/studio-e35-d1"
+          for attempt in 1 2 3; do
+            if python scripts/d1-readonly-backup.py "$dir" >"$RUNNER_TEMP/studio-e35-backup.log" 2>&1; then
+              cat "$RUNNER_TEMP/studio-e35-backup.log"
+              exit 0
+            fi
+            if ! grep -q 'Database changed during backup' "$RUNNER_TEMP/studio-e35-backup.log" || [ "$attempt" -eq 3 ]; then
+              cat "$RUNNER_TEMP/studio-e35-backup.log"
+              exit 1
+            fi
+            sleep 5
+          done
+      - name: Retain private verified D1 recovery material before releasing
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-e35-d1-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/studio-e35-d1/rehearsal-preflight.sql
+            ${{ runner.temp }}/studio-e35-d1/d1-timetravel.json
+            ${{ runner.temp }}/studio-e35-d1/preflight-summary.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Promote the exact writer after an explicit D1 pilot checkpoint
+        run: node scripts/rehearsal-e3-production.mjs
+
+  e4-copy:
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.ref == 'refs/heads/release/v1.5' && startsWith(inputs.confirmation, 'V1.5-R2-E4-COPY ')) }}
+    environment: production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.STUDIO_TEMP_RELEASE_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.STUDIO_R2_MIGRATOR_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.STUDIO_R2_MIGRATOR_SECRET_ACCESS_KEY }}
+      E4_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require exact release CI and valid copy command
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$E4_CONFIRMATION" =~ ^V1\.5-R2-E4-COPY\ ([1-9][0-9]{0,2})$ ]]
+          test "${BASH_REMATCH[1]}" -le 256
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/v15-checks.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f branch=release/v1.5 -f event=push -f status=success \
+            | jq -e --arg sha "$GITHUB_SHA" 'any(.workflow_runs[]; .head_sha == $sha and .conclusion == "success")'
+      - name: Snapshot and verify exact production sources
+        run: python scripts/rehearsal-r2-joint-backup.py "$RUNNER_TEMP/studio-e4"
+      - name: Retain and identify joint backup before copying any objects
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-e4-precopy-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/studio-e4/rehearsal-preflight.sql
+            ${{ runner.temp }}/studio-e4/d1-timetravel.json
+            ${{ runner.temp }}/studio-e4/preflight-summary.json
+            ${{ runner.temp }}/studio-e4/r2-recovery-manifest.json
+            ${{ runner.temp }}/studio-e4/joint-summary.json
+            ${{ runner.temp }}/studio-e4/objects/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Copy only reserved media and verify each object from R2
+        run: python scripts/rehearsal-r2-copy-batch.py "$RUNNER_TEMP/studio-e4" --batch "${E4_CONFIRMATION##* }"
+      - name: Retain fenced attachment statement in the private repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-e4-attach-${{ github.run_id }}
+          path: ${{ runner.temp }}/studio-e4/attach-verified.sql
+          retention-days: 7
+          if-no-files-found: error
+      - name: Present only the verified attachment checkpoint to the operator
+        run: |
+          echo 'Verified (optional, idempotent) D1 attachment; this does not release any D1 bytes:' >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~~sql' >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,1p' "$RUNNER_TEMP/studio-e4/attach-verified.sql" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo '~~~~' >> "$GITHUB_STEP_SUMMARY"

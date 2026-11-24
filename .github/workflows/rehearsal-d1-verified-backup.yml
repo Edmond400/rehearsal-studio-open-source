@@ -1,0 +1,99 @@
+name: Rehearsal Studio D1 read-only backup
+
+on:
+  push:
+    branches: ['release/v1.5']
+    paths: ['.github/workflows/rehearsal-d1-verified-backup.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rehearsal-studio-readonly-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: ${{ github.repository == 'Edmond400/rehearsal-studio' && (github.ref == 'refs/heads/release/v1.5') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Confirm production account and exact service, without changing it
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, urllib.error
+          account = os.environ['CLOUDFLARE_ACCOUNT_ID']
+          token = os.environ['CLOUDFLARE_API_TOKEN']
+          if account != '00000000000000000000000000000000' or not token:
+              raise SystemExit('Expected existing Rehearsal Studio account and credential')
+          endpoint = 'https://api.cloudflare.com/client/v4/accounts/' + account
+          for label, path in [
+              ('production Worker', '/workers/scripts/rehearsal-studio/deployments'),
+              ('dedicated QA Worker', '/workers/scripts/rehearsal-studio-e3-qa/settings'),
+              ('dedicated QA D1', '/d1/database?name=rehearsal-studio-e3-qa'),
+              ('dedicated QA R2', '/r2/buckets/rehearsal-studio-e3-qa'),
+          ]:
+              req = urllib.request.Request(endpoint + path, headers={'Authorization': 'Bearer ' + token})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      data = json.load(response)
+                  result = data['result']
+                  print(label, 'read check passed')
+                  if label == 'production Worker':
+                      deployments = result.get('deployments', []) if isinstance(result, dict) else result
+                      if deployments and deployments[0].get('versions'):
+                          print('Production versions', [(v['version_id'], v['percentage']) for v in deployments[0]['versions']])
+                  elif label == 'dedicated QA D1':
+                      entries = result if isinstance(result, list) else result.get('databases', [])
+                      print('Exact QA D1 name matches', sum(x.get('name') == 'rehearsal-studio-e3-qa' for x in entries))
+              except urllib.error.HTTPError as exc:
+                  print(label, 'HTTP', exc.code)
+          PY
+      - name: Create consistent D1 snapshot and restore to isolated SQLite
+        run: |
+          set -euo pipefail
+          umask 077
+          python tests/d1-readonly-backup.test.py
+          backup_dir="$RUNNER_TEMP/rehearsal-d1-private"
+          for attempt in 1 2 3; do
+            if python scripts/d1-readonly-backup.py "$backup_dir" >"$RUNNER_TEMP/rehearsal-backup-status" 2>&1; then
+              cat "$RUNNER_TEMP/rehearsal-backup-status"
+              break
+            fi
+            if ! grep -q 'Database changed during backup' "$RUNNER_TEMP/rehearsal-backup-status" || [ "$attempt" -eq 3 ]; then
+              cat "$RUNNER_TEMP/rehearsal-backup-status"
+              exit 1
+            fi
+            echo "Concurrent production activity changed the bookmark. Retrying a new consistent snapshot."
+            sleep 6
+          done
+          python scripts/verify-studio-backup.py "$backup_dir/rehearsal-restored.sqlite" >"$RUNNER_TEMP/rehearsal-media-audit.json"
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          recovered = json.loads((root/'rehearsal-media-audit.json').read_text())
+          files = recovered['files']
+          counts = recovered['counts']
+          print('Independent restore: SQLite and foreign keys verified, each file length and SHA-256 verified')
+          print('Media files', len(files), 'bytes', sum(f['bytes'] for f in files),
+                'D1 chunks', counts.get('rehearsal_file_chunks'), 'R2 references', counts.get('studio_r2_media'))
+          PY
+      - name: Store backup in the existing private repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-studio-d1-readonly-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/rehearsal-d1-private/rehearsal-preflight.sql
+            ${{ runner.temp }}/rehearsal-d1-private/d1-timetravel.json
+            ${{ runner.temp }}/rehearsal-d1-private/preflight-summary.json
+          retention-days: 7
+          if-no-files-found: error

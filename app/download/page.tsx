@@ -1,0 +1,1 @@
+export default function Download(){return <section className="panel rh-pad"><h1>Android 测试版</h1><p>安装包尚未发布。当前请使用网页版创建、加入和练习。</p><a className="btn" href="/">打开网页版</a><p>后续安装包将同时提供版本号、更新说明、构建来源和SHA-256校验值。</p></section>}

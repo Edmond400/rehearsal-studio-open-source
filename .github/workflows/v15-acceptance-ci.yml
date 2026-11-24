@@ -1,0 +1,67 @@
+name: V1.5 isolated acceptance CI
+
+on:
+  push:
+    branches: ['feat/v1.5']
+  pull_request:
+    branches: ['feat/v1.4']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v15-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.1'
+          cache: pnpm
+      - name: Install locked dependencies and PPTX fixture renderer
+        run: |
+          pnpm install --frozen-lockfile
+          python -m pip install --disable-pip-version-check python-pptx==1.0.2
+      - name: Typecheck and regression suites
+        run: |
+          set -euo pipefail
+          pnpm check
+          pnpm test:v15
+          pnpm test
+          pnpm test:security
+          pnpm test:transport
+          pnpm test:creation
+          pnpm test:migration
+          pnpm test:deploy-guard
+          pnpm test:v14
+          pnpm test:e2
+          pnpm test:e3
+          node tests/studio-large-files-v14.test.mjs
+      - name: Web and mobile web builds
+        run: |
+          set -euo pipefail
+          pnpm build
+          pnpm --dir mobile install --no-frozen-lockfile
+          npm ci --prefix mobile --no-audit --no-fund
+          pnpm --dir mobile build
+      - name: Isolated browser acceptance (synthetic local D1 only)
+        run: bash scripts/run-v15-browser-ci.sh
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v15-browser-evidence-${{ github.sha }}
+          path: /tmp/rehearsal-v15-evidence/
+          if-no-files-found: ignore
+          retention-days: 7

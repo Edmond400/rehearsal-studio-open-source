@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {dirname} from 'node:path';
+const require=createRequire(import.meta.url);
+const {build}=require(require.resolve('esbuild',{paths:[dirname(require.resolve('wrangler/package.json'))]}));
+const r=await build({entryPoints:['lib/rehearsal/members-v15.ts'],bundle:true,write:false,platform:'neutral',format:'esm'});
+const {parseMemberNames,removeMemberSafely}=await import('data:text/javascript;base64,'+Buffer.from(r.outputFiles[0].text).toString('base64'));
+assert.deepEqual(parseMemberNames('张三，李四、王五;赵六；陈七\n甲 乙',[]).names,['张三','李四','王五','赵六','陈七','甲 乙']);
+assert.deepEqual(parseMemberNames('甲,甲，乙\n乙', ['乙']),{names:['甲'],duplicates:['甲','乙']});
+const p={status:'draft',publishedAt:null,members:[{id:'a',name:'甲',enabled:true},{id:'b',name:'乙',enabled:true}],blocks:[]};
+assert.deepEqual(removeMemberSafely(p,'a',[]).members.map(x=>x.id),['b']);
+assert.equal(removeMemberSafely({...p,blocks:[{memberId:'a'}]},'a',[]).members[0].enabled,false);
+assert.equal(removeMemberSafely(p,'a',[{memberId:'a'}]).members[0].enabled,false);
+assert.equal(removeMemberSafely({...p,status:'published'},'a',[]).members[0].enabled,false);
+assert.throws(()=>removeMemberSafely(p,'missing',[]),/不存在/);
+console.log('PASS V1.5 member split, dedupe, stable ID and non-destructive removal');

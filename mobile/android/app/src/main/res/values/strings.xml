@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">模拟汇报测试版</string>
+    <string name="title_activity_main">模拟汇报测试版</string>
+    <string name="package_name">cn.thuart68.rehearsalstudio</string>
+    <string name="custom_url_scheme">cn.thuart68.rehearsalstudio</string>
+</resources>

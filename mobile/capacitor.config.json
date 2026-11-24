@@ -1,0 +1,13 @@
+{
+  "appId": "cn.thuart68.rehearsalstudio",
+  "appName": "模拟汇报测试版",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https",
+    "hostname": "localhost"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  }
+}

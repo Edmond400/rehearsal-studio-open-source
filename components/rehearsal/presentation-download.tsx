@@ -1,0 +1,12 @@
+'use client';
+import {ErrorContact} from '@/components/developer-contact';
+import {saveBlob} from '@/lib/transport';
+import {useState} from 'react';
+import type {Project} from '@/lib/rehearsal/model';
+import {api} from '@/lib/client';
+import {downloadMedia} from '@/lib/rehearsal/media-client';
+export function PresentationDownload({project,admin=false,editing=false,dirty=false}:{project:Project;admin?:boolean;editing?:boolean;dirty?:boolean}){
+ const [busy,setBusy]=useState(false),[message,setMessage]=useState(''),[error,setError]=useState('');
+ async function download(){setBusy(true);setError('');setMessage('正在核对当前编排…');try{const base=admin?'/api/rehearsal/edit':editing?'/api/rehearsal/edit':'/api/rehearsal',d=await api(base),p=d.project as Project;if(!p||p.revision!==project.revision)throw new Error('材料版本已更新，请刷新后再下载。');if(!p.sourceDeck)throw new Error('请先在编排页补充原始PPTX。');const original=await downloadMedia(base+'/pptx/'+p.sourceDeck.id,p.sourceDeck.bytes,AbortSignal.timeout(180000));setMessage('正在生成各页演讲者备注…');const {exportPptx}=await import('@/lib/rehearsal/pptx'),bytes=exportPptx(original,p);await saveBlob(new Blob([new Uint8Array(bytes)],{type:'application/vnd.openxmlformats-officedocument.presentationml.presentation'}),p.title.replace(/[\\/:*?"<>|]/g,'_')+'_汇报版_r'+p.revision+'.pptx');setMessage('汇报版PPT已生成，开始下载。')}catch(e){setMessage('');setError((e as Error).message)}finally{setBusy(false)}}
+ return <section className="panel rh-pad"><h2>汇报版 PPT</h2><p>每页演讲者备注包含当前映射的讲稿和演讲人；保留原PPT可编辑内容与已有动画。</p><p className="small muted">{project.title} · {project.slides.length}页 · 版本 r{project.revision}{project.status==='draft'?'（草稿）':''}</p>{!project.sourceDeck&&<p className="callout">请在编排页上传与预览对应的原始PPTX后下载。</p>}<button className="btn secondary" disabled={busy||dirty||!project.sourceDeck} onClick={()=>void download()}>{busy?'正在生成…':'一键下载汇报版PPT'}</button>{dirty&&<p>有未保存修改，请先保存。</p>}{message&&<p role="status">{message}</p>}{error&&<p className="callout error" role="alert">{error}<ErrorContact /></p>}</section>;
+}

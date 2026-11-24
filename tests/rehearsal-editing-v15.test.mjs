@@ -1,0 +1,26 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {dirname} from 'node:path';
+const require=createRequire(import.meta.url);
+const {build}=require(require.resolve('esbuild',{paths:[dirname(require.resolve('wrangler/package.json'))]}));
+const bundle=await build({entryPoints:['lib/rehearsal/editing.ts'],bundle:true,write:false,platform:'neutral',format:'esm'});
+const {moveSlide}=await import('data:text/javascript;base64,'+Buffer.from(bundle.outputFiles[0].text).toString('base64'));
+const p={slides:['a','b','c'].map((id,pageIndex)=>({id,pageIndex,sourceId:'s'+id,sourcePage:'ppt/slides/slide'+(pageIndex+1)+'.xml'})),blocks:[{id:'t1',memberId:'m',slideIndex:0},{id:'t2',memberId:'m',slideIndex:2},{id:'t3',slideIndex:null}],overrides:{turn:{seconds:21,reason:'historical'}}};
+const r=moveSlide(p,'a',2);
+assert.deepEqual(r.slides.map(s=>s.id),['b','c','a']);
+assert.deepEqual(r.slides.map(s=>s.pageIndex),[0,1,2]);
+assert.deepEqual(r.blocks.map(b=>b.slideIndex),[2,1,null]);
+assert.equal(r.blocks[0].memberId,'m');assert.equal(r.overrides.turn.seconds,21);
+assert.deepEqual(moveSlide(r,'a',0).slides.map(s=>s.id),['a','b','c']);
+assert.strictEqual(moveSlide(p,'a',0),p);
+assert.throws(()=>moveSlide(p,'nonexistent',1),/无效/);
+// 200-page identity and 500-block stress: mapping must remain tied to original slide IDs.
+const largeSlides=Array.from({length:200},(_,pageIndex)=>({id:'slide-'+pageIndex,pageIndex}));
+const largeBlocks=Array.from({length:500},(_,i)=>({id:'block-'+i,slideIndex:i%200,memberId:'speaker',text:'fixture'}));
+const big={...p,slides:largeSlides,blocks:largeBlocks};
+const t0=performance.now();
+const moved=moveSlide(big,'slide-0',199);
+assert.equal(moved.slides[199].id,'slide-0');
+for(let i=0;i<largeBlocks.length;i++)assert.equal(moved.slides[moved.blocks[i].slideIndex].id,'slide-'+(i%200));
+assert(performance.now()-t0<2000,'200-page mapping operation unexpectedly slow');
+console.log('PASS V1.5 moveSlide stable identities, mapping preservation and roundtrip');
