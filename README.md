@@ -12,6 +12,7 @@ PPTX 导入、讲稿编辑、成员分工、排练录音、全组回放、Androi
 git clone https://github.com/Edmond400/rehearsal-studio-open-source.git
 cd rehearsal-studio-open-source
 pnpm install --frozen-lockfile
+python -m pip install -r requirements-dev.txt
 pnpm check
 pnpm test
 pnpm build
